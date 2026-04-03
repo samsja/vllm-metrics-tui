@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: vllm-metrics-tui
+Version: 0.1.0
+Summary: Lightweight TUI for monitoring vLLM Prometheus metrics
+Requires-Python: >=3.10
+Requires-Dist: httpx
+Requires-Dist: packaging
+Requires-Dist: prometheus-client
+Requires-Dist: textual

@@ -1,0 +1,2 @@
+[console_scripts]
+vllm-metrics-tui = vllm_metrics_tui:main
