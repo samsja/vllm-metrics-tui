@@ -5,6 +5,7 @@ description = "Lightweight TUI for monitoring vLLM Prometheus metrics"
 requires-python = ">=3.10"
 dependencies = [
     "httpx",
+    "packaging",
     "prometheus-client",
     "textual",
 ]

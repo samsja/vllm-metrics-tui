@@ -24,7 +24,7 @@ from textual.widgets import Sparkline
 GAUGE_METRICS = {
     "vllm:num_requests_running",
     "vllm:num_requests_waiting",
-    "vllm:gpu_cache_usage_perc",
+    "vllm:kv_cache_usage_perc",
 }
 
 COUNTER_METRICS = {
@@ -40,7 +40,7 @@ COUNTER_RATE_NAMES = {
 METRIC_DISPLAY = {
     "vllm:num_requests_running": ("Requests Running", ""),
     "vllm:num_requests_waiting": ("Requests Waiting", ""),
-    "vllm:gpu_cache_usage_perc": ("KV Cache Usage", "%"),
+    "vllm:kv_cache_usage_perc": ("KV Cache Usage", "%"),
     "prompt_throughput_tps": ("Prompt Throughput", "tok/s"),
     "generation_throughput_tps": ("Generation Throughput", "tok/s"),
 }
@@ -220,7 +220,7 @@ class ServerPanel(Static):
     METRIC_ORDER = [
         "num_requests_running",
         "num_requests_waiting",
-        "gpu_cache_usage_perc",
+        "kv_cache_usage_perc",
         "prompt_throughput_tps",
         "generation_throughput_tps",
     ]
