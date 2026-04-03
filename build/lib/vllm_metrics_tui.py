@@ -135,13 +135,13 @@ class Store:
         return parse_metrics(resp.text)
 
 
-def make_graph(data: list[float], width: int, height: int, title: str, color: str = "white") -> str:
+def make_graph(data: list[float], width: int, height: int, title: str, color: str = "cyan") -> str:
     plt.clear_figure()
     plt.theme("clear")
     plt.plotsize(width, height)
     plt.canvas_color("default")
     plt.axes_color("default")
-    plt.ticks_color("gray")
+    plt.ticks_color("white")
     if data:
         plt.plot(list(range(len(data))), data, color=color, marker="braille")
         if len(data) > 1:
@@ -194,7 +194,7 @@ def build_dashboard(store: Store, term_width: int, term_height: int) -> Layout:
     summary = Panel(
         Group(status, tbl),
         title="[bold]vLLM Inference[/bold]",
-        border_style="blue",
+        border_style="dim",
     )
 
     # Graphs - 2 columns, 3 rows
@@ -202,12 +202,12 @@ def build_dashboard(store: Store, term_width: int, term_height: int) -> Layout:
     graph_h = max((term_height - 14) // 3, 5)
 
     graphs = [
-        ("prefill_tps", "Prefill tok/s", "white"),
-        ("decode_tps", "Decode tok/s", "white"),
-        ("running", "Running", "white"),
-        ("waiting", "Waiting", "white"),
-        ("kv_max", "KV Cache (max)", "white"),
-        ("kv_xfer_ms", "KV Transfer (ms)", "white"),
+        ("prefill_tps", "Prefill tok/s", "cyan"),
+        ("decode_tps", "Decode tok/s", "cyan"),
+        ("running", "Running", "cyan"),
+        ("waiting", "Waiting", "cyan"),
+        ("kv_max", "KV Cache (max)", "cyan"),
+        ("kv_xfer_ms", "KV Transfer (ms)", "cyan"),
     ]
 
     layout = Layout()
