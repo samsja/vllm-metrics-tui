@@ -135,18 +135,21 @@ class Store:
         return parse_metrics(resp.text)
 
 
-def make_graph(data: list[float], width: int, height: int, title: str, color: str = "cyan", y_label: str = "") -> str:
+def make_graph(data: list[float], width: int, height: int, title: str, color: str = "white") -> str:
     plt.clear_figure()
     plt.theme("clear")
     plt.plotsize(width, height)
+    plt.canvas_color("default")
+    plt.axes_color("default")
+    plt.ticks_color("gray")
     if data:
-        plt.plot(list(range(len(data))), data, color=color)
+        plt.plot(list(range(len(data))), data, color=color, marker="braille")
         if len(data) > 1:
             plt.xlim(0, WINDOW_SIZE)
     else:
         plt.plot([0], [0], color=color)
     plt.xaxes(False)
-    plt.yaxes(True, True)
+    plt.yaxes(True, False)
     plt.title(title)
     return plt.build()
 
@@ -199,12 +202,12 @@ def build_dashboard(store: Store, term_width: int, term_height: int) -> Layout:
     graph_h = max((term_height - 14) // 3, 5)
 
     graphs = [
-        ("prefill_tps", "Prefill tok/s", "cyan"),
-        ("decode_tps", "Decode tok/s", "green"),
-        ("running", "Running Requests", "yellow"),
-        ("waiting", "Waiting Requests", "red"),
-        ("kv_max", "KV Cache (max)", "magenta"),
-        ("kv_xfer_ms", "KV Transfer (ms)", "blue"),
+        ("prefill_tps", "Prefill tok/s", "white"),
+        ("decode_tps", "Decode tok/s", "white"),
+        ("running", "Running", "white"),
+        ("waiting", "Waiting", "white"),
+        ("kv_max", "KV Cache (max)", "white"),
+        ("kv_xfer_ms", "KV Transfer (ms)", "white"),
     ]
 
     layout = Layout()
