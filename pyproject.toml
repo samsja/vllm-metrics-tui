@@ -1,0 +1,13 @@
+[project]
+name = "vllm-metrics-tui"
+version = "0.1.0"
+description = "Lightweight TUI for monitoring vLLM Prometheus metrics"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx",
+    "prometheus-client",
+    "textual",
+]
+
+[project.scripts]
+vllm-metrics-tui = "vllm_metrics_tui:main"
