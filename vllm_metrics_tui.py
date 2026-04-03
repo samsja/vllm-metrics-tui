@@ -25,26 +25,30 @@ WINDOW_SIZE = 120
 
 def parse_metrics(text: str) -> dict[str, float]:
     out: dict[str, float] = {}
+    engines: set[str] = set()
     for family in text_string_to_metric_families(text):
         n = family.name
         if n == "vllm:num_requests_running":
             out["running"] = sum(s.value for s in family.samples)
+            for s in family.samples:
+                engines.add(s.labels.get("engine", "0"))
         elif n == "vllm:num_requests_waiting":
             out["waiting"] = sum(s.value for s in family.samples)
         elif n == "vllm:kv_cache_usage_perc":
             vals = [s.value for s in family.samples]
             out["kv_cache"] = max(vals) if vals else 0
-        elif n == "vllm:prompt_tokens_total":
+        elif n == "vllm:prompt_tokens":
             out["prompt_tokens"] = sum(s.value for s in family.samples)
-        elif n == "vllm:generation_tokens_total":
+        elif n == "vllm:generation_tokens":
             out["gen_tokens"] = sum(s.value for s in family.samples)
-        elif n == "vllm:request_success_total":
+        elif n == "vllm:request_success":
             out["completed"] = sum(s.value for s in family.samples)
         elif n == "vllm:nixl_xfer_time_seconds":
             sums = [s.value for s in family.samples if s.name.endswith("_sum")]
             counts = [s.value for s in family.samples if s.name.endswith("_count")]
             out["kv_xfer_sum"] = sum(sums)
             out["kv_xfer_count"] = sum(counts)
+    out["n_engines"] = len(engines) if engines else 1
     return out
 
 
@@ -58,6 +62,12 @@ class Store:
         self.history: dict[str, deque[float]] = {}
         self.current: dict[str, float] = {}
         self.errors: int = 0
+        self._roles: dict[str, str] = {}
+        for url in urls:
+            port = int(url.rsplit(":", 1)[-1].split("/")[0])
+            self._roles[url] = "decode" if port >= 8200 else "prefill"
+        self.n_prefill_nodes = sum(1 for r in self._roles.values() if r == "prefill")
+        self.n_decode_nodes = sum(1 for r in self._roles.values() if r == "decode")
 
     async def start(self):
         for url in self.urls:
@@ -86,6 +96,7 @@ class Store:
         out: dict[str, float] = {}
         out["running"] = agg.get("running", 0)
         out["waiting"] = agg.get("waiting", 0)
+        out["n_engines"] = agg.get("n_engines", 0)
         kv_vals = [r.get("kv_cache", 0) for r in self._raw.values()]
         out["kv_max"] = max(kv_vals) if kv_vals else 0
 
@@ -102,6 +113,9 @@ class Store:
             out["prefill_tps"] = rate("prompt_tokens")
             out["decode_tps"] = rate("gen_tokens")
             out["req_per_s"] = rate("completed")
+
+            out["prefill_tps_node"] = out["prefill_tps"] / self.n_prefill_nodes if self.n_prefill_nodes else 0
+            out["decode_tps_node"] = out["decode_tps"] / self.n_decode_nodes if self.n_decode_nodes else 0
 
             xd = agg.get("kv_xfer_sum", 0) - prev_agg.get("kv_xfer_sum", 0)
             xc = agg.get("kv_xfer_count", 0) - prev_agg.get("kv_xfer_count", 0)
@@ -165,10 +179,14 @@ def build_dashboard(store: Store, term_width: int, term_height: int) -> Layout:
             return f"[bold cyan]{v:,.1f}[/bold cyan] [dim]{unit}[/dim]"
         return f"[bold cyan]{v:,.0f}[/bold cyan]"
 
+    n_gpus = int(c.get("n_engines", 0)) if "n_engines" in c else 0
+    gpu_label = f" [dim]({n_gpus} GPUs)[/dim]" if n_gpus else ""
+
     tbl.add_row("Prefill", fv("prefill_tps", "tok/s"), "Decode", fv("decode_tps", "tok/s"))
+    tbl.add_row("Prefill/node", fv("prefill_tps_node", "tok/s"), "Decode/node", fv("decode_tps_node", "tok/s"))
     tbl.add_row("Running", fv("running", ""), "Waiting", fv("waiting", ""))
     tbl.add_row("Completed", fv("req_per_s", "req/s"), "KV Transfer", fv("kv_xfer_ms", "ms"))
-    tbl.add_row("KV Cache (max)", fv("kv_max", "%"), "", "")
+    tbl.add_row("KV Cache (max)", fv("kv_max", "%"), "Nodes", f"[bold cyan]{store.n_prefill_nodes}P + {store.n_decode_nodes}D[/bold cyan]")
 
     summary = Panel(
         Group(status, tbl),
@@ -191,7 +209,7 @@ def build_dashboard(store: Store, term_width: int, term_height: int) -> Layout:
 
     layout = Layout()
     layout.split_column(
-        Layout(summary, name="summary", size=9),
+        Layout(summary, name="summary", size=10),
         Layout(name="graphs"),
     )
 
