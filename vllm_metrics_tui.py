@@ -1,392 +1,251 @@
 #!/usr/bin/env python3
-"""Lightweight TUI for monitoring vLLM Prometheus metrics.
-
-Usage:
-    python vllm_metrics_tui.py http://localhost:8000 [http://localhost:8001 ...]
-    python vllm_metrics_tui.py --help
-"""
+"""Lightweight TUI for monitoring vLLM Prometheus metrics."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import time
 from collections import deque
 
 import httpx
+import plotext as plt
 from prometheus_client.parser import text_string_to_metric_families
-from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Header, Static
-from textual.widgets import Sparkline
-
-
-GAUGE_METRICS = {
-    "vllm:num_requests_running",
-    "vllm:num_requests_waiting",
-    "vllm:kv_cache_usage_perc",
-}
-
-COUNTER_METRICS = {
-    "vllm:prompt_tokens",
-    "vllm:generation_tokens",
-}
-
-COUNTER_RATE_NAMES = {
-    "vllm:prompt_tokens": "prompt_throughput_tps",
-    "vllm:generation_tokens": "generation_throughput_tps",
-}
-
-METRIC_DISPLAY = {
-    "vllm:num_requests_running": ("Requests Running", ""),
-    "vllm:num_requests_waiting": ("Requests Waiting", ""),
-    "vllm:kv_cache_usage_perc": ("KV Cache Usage", "%"),
-    "prompt_throughput_tps": ("Prompt Throughput", "tok/s"),
-    "generation_throughput_tps": ("Generation Throughput", "tok/s"),
-}
+from rich.console import Console, Group
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 POLL_INTERVAL = 5.0
-WINDOW_SIZE = 60  # 5 minutes of history at 5s intervals
+WINDOW_SIZE = 120
 
 
-def parse_prometheus_text(
-    text: str,
-) -> tuple[dict[tuple[str, str], float], dict[tuple[str, str], float]]:
-    gauges: dict[tuple[str, str], float] = {}
-    counters: dict[tuple[str, str], float] = {}
+def parse_metrics(text: str) -> dict[str, float]:
+    out: dict[str, float] = {}
     for family in text_string_to_metric_families(text):
-        if family.type == "gauge" and family.name in GAUGE_METRICS:
-            for sample in family.samples:
-                engine = sample.labels.get("engine", "0")
-                gauges[(family.name, engine)] = sample.value
-        elif family.type == "counter" and family.name in COUNTER_METRICS:
-            for sample in family.samples:
-                engine = sample.labels.get("engine", "0")
-                counters[(family.name, engine)] = sample.value
-    return gauges, counters
+        n = family.name
+        if n == "vllm:num_requests_running":
+            out["running"] = sum(s.value for s in family.samples)
+        elif n == "vllm:num_requests_waiting":
+            out["waiting"] = sum(s.value for s in family.samples)
+        elif n == "vllm:kv_cache_usage_perc":
+            vals = [s.value for s in family.samples]
+            out["kv_cache"] = max(vals) if vals else 0
+        elif n == "vllm:prompt_tokens_total":
+            out["prompt_tokens"] = sum(s.value for s in family.samples)
+        elif n == "vllm:generation_tokens_total":
+            out["gen_tokens"] = sum(s.value for s in family.samples)
+        elif n == "vllm:request_success_total":
+            out["completed"] = sum(s.value for s in family.samples)
+        elif n == "vllm:nixl_xfer_time_seconds":
+            sums = [s.value for s in family.samples if s.name.endswith("_sum")]
+            counts = [s.value for s in family.samples if s.name.endswith("_count")]
+            out["kv_xfer_sum"] = sum(sums)
+            out["kv_xfer_count"] = sum(counts)
+    return out
 
 
-class MetricsStore:
-    """Collects and stores metrics from multiple vLLM servers."""
-
-    def __init__(self, urls: list[str], window_size: int = WINDOW_SIZE):
+class Store:
+    def __init__(self, urls: list[str]):
         self.urls = urls
-        self.window_size = window_size
-        self.history: dict[tuple[str, str, str], deque[float]] = {}
-        self._prev_counters: dict[tuple[str, str, str], tuple[float, float]] = {}
         self._clients: dict[str, httpx.AsyncClient] = {}
-        self._errors: dict[str, str | None] = {url: None for url in urls}
+        self._raw: dict[str, dict[str, float]] = {}
+        self._prev: dict[str, dict[str, float]] = {}
+        self._prev_time: float = 0
+        self.history: dict[str, deque[float]] = {}
+        self.current: dict[str, float] = {}
+        self.errors: int = 0
 
     async def start(self):
         for url in self.urls:
             self._clients[url] = httpx.AsyncClient(base_url=url, timeout=5.0)
 
     async def stop(self):
-        for client in self._clients.values():
-            await client.aclose()
+        for c in self._clients.values():
+            await c.aclose()
 
     async def poll(self):
         now = time.monotonic()
         results = await asyncio.gather(
-            *[self._fetch(url) for url in self.urls], return_exceptions=True
+            *[self._fetch(u) for u in self.urls], return_exceptions=True
         )
-        for url, result in zip(self.urls, results):
-            if isinstance(result, Exception):
-                self._errors[url] = str(result)
+
+        agg: dict[str, float] = {}
+        self.errors = 0
+        for url, res in zip(self.urls, results):
+            if isinstance(res, Exception):
+                self.errors += 1
                 continue
-            gauges, counters = result
-            self._errors[url] = None
+            self._raw[url] = res
+            for k, v in res.items():
+                agg[k] = agg.get(k, 0) + v
 
-            for (metric, engine), value in gauges.items():
-                key = (url, metric, engine)
-                if key not in self.history:
-                    self.history[key] = deque(maxlen=self.window_size)
-                self.history[key].append(value)
+        out: dict[str, float] = {}
+        out["running"] = agg.get("running", 0)
+        out["waiting"] = agg.get("waiting", 0)
+        kv_vals = [r.get("kv_cache", 0) for r in self._raw.values()]
+        out["kv_max"] = max(kv_vals) if kv_vals else 0
 
-            for (metric, engine), value in counters.items():
-                key = (url, metric, engine)
-                prev = self._prev_counters.get(key)
-                self._prev_counters[key] = (now, value)
-                if prev is None:
-                    continue
-                prev_time, prev_value = prev
-                dt = now - prev_time
-                if dt <= 0:
-                    continue
-                rate = (value - prev_value) / dt
-                rate_key = (url, COUNTER_RATE_NAMES[metric], engine)
-                if rate_key not in self.history:
-                    self.history[rate_key] = deque(maxlen=self.window_size)
-                self.history[rate_key].append(rate)
+        dt = now - self._prev_time if self._prev_time else 0
+        if dt > 0 and self._prev:
+            prev_agg: dict[str, float] = {}
+            for r in self._prev.values():
+                for k, v in r.items():
+                    prev_agg[k] = prev_agg.get(k, 0) + v
 
-    async def _fetch(
-        self, url: str
-    ) -> tuple[dict[tuple[str, str], float], dict[tuple[str, str], float]]:
-        client = self._clients[url]
-        response = await client.get("/metrics")
-        response.raise_for_status()
-        return parse_prometheus_text(response.text)
+            def rate(key: str) -> float:
+                return max((agg.get(key, 0) - prev_agg.get(key, 0)) / dt, 0)
 
-    def get_server_metrics(
-        self, url: str
-    ) -> dict[str, tuple[float, list[float]]]:
-        """Returns {metric_short_name: (current_value, history_list)} for a server."""
-        out: dict[str, tuple[float, list[float]]] = {}
-        for (u, metric, engine), values in self.history.items():
-            if u != url or not values:
-                continue
-            short = metric.removeprefix("vllm:")
-            history_list = list(values)
-            current = history_list[-1]
-            out[short] = (current, history_list)
-        return out
+            out["prefill_tps"] = rate("prompt_tokens")
+            out["decode_tps"] = rate("gen_tokens")
+            out["req_per_s"] = rate("completed")
 
-    def get_error(self, url: str) -> str | None:
-        return self._errors.get(url)
+            xd = agg.get("kv_xfer_sum", 0) - prev_agg.get("kv_xfer_sum", 0)
+            xc = agg.get("kv_xfer_count", 0) - prev_agg.get("kv_xfer_count", 0)
+            out["kv_xfer_ms"] = (xd / xc * 1000) if xc > 0 else 0
+
+        self._prev = {u: dict(r) for u, r in self._raw.items()}
+        self._prev_time = now
+
+        for k, v in out.items():
+            self.history.setdefault(k, deque(maxlen=WINDOW_SIZE)).append(v)
+
+        self.current = out
+
+    async def _fetch(self, url: str) -> dict[str, float]:
+        resp = await self._clients[url].get("/metrics")
+        resp.raise_for_status()
+        return parse_metrics(resp.text)
 
 
-class MetricPanel(Static):
-    """A single metric display with sparkline."""
-
-    DEFAULT_CSS = """
-    MetricPanel {
-        height: auto;
-        padding: 0 1;
-        margin: 0 0 1 0;
-    }
-    """
-
-    def __init__(self, label: str, unit: str = "", **kwargs):
-        super().__init__(**kwargs)
-        self.label = label
-        self.unit = unit
-
-    def compose(self) -> ComposeResult:
-        yield Static(f"{self.label}", classes="metric-label")
-        yield Static("--", id=f"value-{self.id}", classes="metric-value")
-        yield Sparkline([], id=f"spark-{self.id}")
-
-    def update_metric(self, value: float, history: list[float]):
-        val_widget = self.query_one(f"#value-{self.id}", Static)
-        spark_widget = self.query_one(f"#spark-{self.id}", Sparkline)
-        if self.unit == "%":
-            val_widget.update(f"  {value:.1%}")
-        elif self.unit == "tok/s":
-            val_widget.update(f"  {value:.1f} {self.unit}")
-        else:
-            val_widget.update(f"  {value:.0f}")
-        spark_widget.data = history
+def make_graph(data: list[float], width: int, height: int, title: str, color: str = "cyan", y_label: str = "") -> str:
+    plt.clear_figure()
+    plt.theme("dark")
+    plt.plotsize(width, height)
+    if data:
+        plt.plot(list(range(len(data))), data, color=color)
+        if len(data) > 1:
+            plt.xlim(0, WINDOW_SIZE)
+    else:
+        plt.plot([0], [0], color=color)
+    plt.xaxes(False)
+    plt.yaxes(True, True)
+    plt.title(title)
+    return plt.build()
 
 
-class ServerPanel(Static):
-    """Panel for one vLLM server."""
+def build_dashboard(store: Store, term_width: int, term_height: int) -> Layout:
+    c = store.current
+    n_ok = len(store.urls) - store.errors
+    n_total = len(store.urls)
 
-    DEFAULT_CSS = """
-    ServerPanel {
-        border: solid $primary;
-        height: auto;
-        padding: 1;
-        margin: 1;
-    }
+    # Status line
+    if store.errors == 0:
+        status = Text(f" {n_ok}/{n_total} nodes healthy", style="bold green")
+    else:
+        status = Text(f" {n_ok}/{n_total} nodes healthy ({store.errors} errors)", style="bold red")
 
-    ServerPanel.error {
-        border: solid $error;
-    }
+    # Summary table
+    tbl = Table(show_header=False, expand=True, box=None, padding=(0, 2))
+    tbl.add_column("metric", style="bold white", width=16)
+    tbl.add_column("value", style="bold cyan", justify="right", width=14)
+    tbl.add_column("metric", style="bold white", width=16)
+    tbl.add_column("value", style="bold cyan", justify="right", width=14)
 
-    .metric-label {
-        text-style: bold;
-    }
+    def fv(key: str, unit: str) -> str:
+        v = c.get(key)
+        if v is None:
+            return "[dim]--[/dim]"
+        if unit == "%":
+            return f"[bold cyan]{v:.1%}[/bold cyan]"
+        if unit in ("tok/s", "req/s", "ms"):
+            return f"[bold cyan]{v:,.1f}[/bold cyan] [dim]{unit}[/dim]"
+        return f"[bold cyan]{v:,.0f}[/bold cyan]"
 
-    .metric-value {
-        color: $success;
-    }
+    tbl.add_row("Prefill", fv("prefill_tps", "tok/s"), "Decode", fv("decode_tps", "tok/s"))
+    tbl.add_row("Running", fv("running", ""), "Waiting", fv("waiting", ""))
+    tbl.add_row("Completed", fv("req_per_s", "req/s"), "KV Transfer", fv("kv_xfer_ms", "ms"))
+    tbl.add_row("KV Cache (max)", fv("kv_max", "%"), "", "")
 
-    .server-status {
-        dock: top;
-        text-style: bold;
-        margin-bottom: 1;
-    }
+    summary = Panel(
+        Group(status, tbl),
+        title="[bold]vLLM Inference[/bold]",
+        border_style="blue",
+    )
 
-    .server-error {
-        color: $error;
-    }
+    # Graphs - 2 columns, 3 rows
+    graph_w = max((term_width // 2) - 4, 20)
+    graph_h = max((term_height - 14) // 3, 5)
 
-    Sparkline {
-        height: 2;
-        margin: 0 0 0 2;
-    }
-    """
-
-    METRIC_ORDER = [
-        "num_requests_running",
-        "num_requests_waiting",
-        "kv_cache_usage_perc",
-        "prompt_throughput_tps",
-        "generation_throughput_tps",
+    graphs = [
+        ("prefill_tps", "Prefill tok/s", "cyan"),
+        ("decode_tps", "Decode tok/s", "green"),
+        ("running", "Running Requests", "yellow"),
+        ("waiting", "Waiting Requests", "red"),
+        ("kv_max", "KV Cache (max)", "magenta"),
+        ("kv_xfer_ms", "KV Transfer (ms)", "blue"),
     ]
 
-    def __init__(self, url: str, server_idx: int, **kwargs):
-        super().__init__(id=f"server-{server_idx}", **kwargs)
-        self.url = url
-        self.server_idx = server_idx
+    layout = Layout()
+    layout.split_column(
+        Layout(summary, name="summary", size=9),
+        Layout(name="graphs"),
+    )
 
-    def compose(self) -> ComposeResult:
-        yield Static(
-            f"Server {self.server_idx}: {self.url}",
-            classes="server-status",
-            id=f"status-{self.server_idx}",
-        )
-        for short_name in self.METRIC_ORDER:
-            full_key = f"vllm:{short_name}" if not short_name.endswith("_tps") else short_name
-            label, unit = METRIC_DISPLAY.get(full_key, (short_name, ""))
-            yield MetricPanel(
-                label=label,
-                unit=unit,
-                id=f"m-{self.server_idx}-{short_name}",
+    graph_rows = []
+    for i in range(0, len(graphs), 2):
+        row = Layout(name=f"grow{i}")
+        left_key, left_title, left_color = graphs[i]
+        left_data = list(store.history.get(left_key, []))
+        left_graph = make_graph(left_data, graph_w, graph_h, left_title, left_color)
+
+        if i + 1 < len(graphs):
+            right_key, right_title, right_color = graphs[i + 1]
+            right_data = list(store.history.get(right_key, []))
+            right_graph = make_graph(right_data, graph_w, graph_h, right_title, right_color)
+            row.split_row(
+                Layout(Panel(Text.from_ansi(left_graph), border_style="dim"), name=f"g{i}"),
+                Layout(Panel(Text.from_ansi(right_graph), border_style="dim"), name=f"g{i+1}"),
             )
-
-    def update_data(
-        self, metrics: dict[str, tuple[float, list[float]]], error: str | None
-    ):
-        status = self.query_one(f"#status-{self.server_idx}", Static)
-        if error:
-            status.update(f"Server {self.server_idx}: {self.url} [red]ERROR[/red]")
-            self.add_class("error")
-            return
         else:
-            status.update(f"Server {self.server_idx}: {self.url} [green]OK[/green]")
-            self.remove_class("error")
+            row.split_row(
+                Layout(Panel(Text.from_ansi(left_graph), border_style="dim"), name=f"g{i}"),
+            )
+        graph_rows.append(row)
 
-        for short_name in self.METRIC_ORDER:
-            panel_id = f"m-{self.server_idx}-{short_name}"
-            panel = self.query_one(f"#{panel_id}", MetricPanel)
-            if short_name in metrics:
-                value, history = metrics[short_name]
-                panel.update_metric(value, history)
+    layout["graphs"].split_column(*graph_rows)
+    return layout
 
 
-class VllmMetricsTui(App):
-    """vLLM Metrics TUI - lightweight Prometheus metrics viewer."""
+async def run(urls: list[str], interval: float):
+    store = Store(urls)
+    await store.start()
 
-    CSS = """
-    Screen {
-        layout: vertical;
-    }
-
-    #servers {
-        layout: grid;
-        grid-gutter: 0;
-    }
-
-    #aggregate {
-        dock: bottom;
-        height: 3;
-        padding: 0 2;
-        background: $surface;
-        border-top: solid $primary;
-    }
-    """
-
-    BINDINGS = [
-        ("q", "quit", "Quit"),
-        ("r", "force_refresh", "Refresh"),
-    ]
-
-    def __init__(self, urls: list[str], poll_interval: float = POLL_INTERVAL):
-        super().__init__()
-        self.urls = urls
-        self.poll_interval = poll_interval
-        self.store = MetricsStore(urls)
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        with Vertical(id="servers"):
-            for i, url in enumerate(self.urls):
-                yield ServerPanel(url, i)
-        yield Static("Waiting for first poll...", id="aggregate")
-        yield Footer()
-
-    async def on_mount(self):
-        self.title = "vLLM Metrics"
-        self.sub_title = f"Polling every {self.poll_interval:.0f}s"
-        # Adjust grid columns based on server count
-        servers = self.query_one("#servers")
-        n = len(self.urls)
-        if n <= 2:
-            servers.styles.grid_size_columns = n
-        elif n <= 4:
-            servers.styles.grid_size_columns = 2
-        else:
-            servers.styles.grid_size_columns = 3
-
-        await self.store.start()
-        self.set_interval(self.poll_interval, self._poll_and_update)
-        # Do an initial poll immediately
-        await self._poll_and_update()
-
-    async def _poll_and_update(self):
-        await self.store.poll()
-        for i, url in enumerate(self.urls):
-            panel = self.query_one(f"#server-{i}", ServerPanel)
-            metrics = self.store.get_server_metrics(url)
-            error = self.store.get_error(url)
-            panel.update_data(metrics, error)
-
-        # Update aggregate bar
-        agg = self.query_one("#aggregate", Static)
-        all_metrics: dict[str, list[float]] = {}
-        for url in self.urls:
-            for name, (val, _) in self.store.get_server_metrics(url).items():
-                all_metrics.setdefault(name, []).append(val)
-
-        if all_metrics:
-            parts = []
-            for name in ServerPanel.METRIC_ORDER:
-                if name not in all_metrics:
-                    continue
-                vals = all_metrics[name]
-                full_key = f"vllm:{name}" if not name.endswith("_tps") else name
-                label, unit = METRIC_DISPLAY.get(full_key, (name, ""))
-                avg = sum(vals) / len(vals)
-                total = sum(vals)
-                if unit == "%":
-                    parts.append(f"{label}: avg={avg:.1%}")
-                elif unit == "tok/s":
-                    parts.append(f"{label}: sum={total:.0f} tok/s")
-                else:
-                    parts.append(f"{label}: sum={total:.0f}")
-            agg.update(" | ".join(parts))
-
-    async def action_force_refresh(self):
-        await self._poll_and_update()
-
-    async def action_quit(self):
-        await self.store.stop()
-        self.exit()
+    console = Console()
+    try:
+        with Live(console=console, refresh_per_second=1, screen=True) as live:
+            while True:
+                await store.poll()
+                w = console.width
+                h = console.height
+                layout = build_dashboard(store, w, h)
+                live.update(layout)
+                await asyncio.sleep(interval)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        await store.stop()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Lightweight TUI for monitoring vLLM Prometheus metrics"
-    )
-    parser.add_argument(
-        "urls",
-        nargs="+",
-        help="vLLM server base URLs (e.g. http://localhost:8000)",
-    )
-    parser.add_argument(
-        "--interval",
-        type=float,
-        default=POLL_INTERVAL,
-        help=f"Poll interval in seconds (default: {POLL_INTERVAL})",
-    )
+    parser = argparse.ArgumentParser(description="vLLM Metrics TUI")
+    parser.add_argument("urls", nargs="+", help="vLLM server URLs")
+    parser.add_argument("--interval", type=float, default=POLL_INTERVAL)
     args = parser.parse_args()
-
-    # Normalize URLs (strip trailing slash)
-    urls = [url.rstrip("/") for url in args.urls]
-
-    app = VllmMetricsTui(urls, poll_interval=args.interval)
-    app.run()
+    asyncio.run(run([u.rstrip("/") for u in args.urls], args.interval))
 
 
 if __name__ == "__main__":
