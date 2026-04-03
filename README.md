@@ -1,5 +1,8 @@
 # vllm-metrics-tui
 
+<img width="983" height="882" alt="image" src="https://github.com/user-attachments/assets/287e759f-b48a-49bb-a906-02a6ac48f3ac" />
+
+
 Lightweight terminal dashboard for monitoring [vLLM](https://github.com/vllm-project/vllm) inference servers. Polls the Prometheus `/metrics` endpoint directly — no Prometheus server, no Grafana, no infrastructure needed.
 
 Built with [Textual](https://github.com/Textualize/textual).
